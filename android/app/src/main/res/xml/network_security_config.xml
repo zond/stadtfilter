@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  just_audio serves streams that carry custom request headers (here, a browser
+  User-Agent the stream server requires) through a local proxy on 127.0.0.1
+  using cleartext. Permit cleartext for localhost only; all real network
+  traffic (the HTTPS stream + metadata) stays encrypted.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+</network-security-config>
