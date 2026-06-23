@@ -15,17 +15,27 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net/http"
+	"os"
+	"os/signal"
 	"sync"
+	"syscall"
 	"time"
 )
 
-const (
-	// upstreamURL is the real Radio Stadtfilter MP3 stream.
-	upstreamURL = "https://streamer.stadtfilter.net/stadtfilter.mp3"
+// upstreamURLs are the Radio Stadtfilter MP3 stream endpoints, tried in order.
+// The pump sticks with whichever one is working and falls back to the next on
+// failure, so an outage or throttle on one mount doesn't take the relay down.
+var upstreamURLs = []string{
+	"https://streamer.stadtfilter.net/stadtfilter.mp3",
+	"http://streamer1.stadtfilter.net:8406/stadtfilter.mp3",
+}
 
+const (
 	// userAgent makes the origin treat us as a browser. The same string is used
 	// by the Flutter app (see lib/audio_player_handler.dart). Without a
 	// browser-like UA the origin accepts the connection but never sends bytes.
@@ -43,6 +53,11 @@ const (
 	// subBuffer is how many chunks a listener may fall behind before it is
 	// dropped as too slow (chunkSize * subBuffer bytes of slack ~= a few MB).
 	subBuffer = 256
+
+	// burstMax is how much recent audio we keep to "burst" to a newly connected
+	// listener, so playback starts immediately instead of waiting for the next
+	// upstream bytes. Mirrors Icecast's burst-on-connect behaviour.
+	burstMax = 256 * 1024
 )
 
 func main() {
@@ -53,15 +68,39 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		listeners, connected := h.stats()
+		upstream := "down"
+		if connected {
+			upstream = "up"
+		}
+		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, "ok\n")
+		fmt.Fprintf(w, "ok\nlisteners %d\nupstream %s\n", listeners, upstream)
 	})
 	mux.HandleFunc("/", h.serveStream)
 
 	srv := &http.Server{Addr: *addr, Handler: mux}
-	log.Printf("relay listening on %s, upstream %s", *addr, upstreamURL)
-	if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		log.Fatalf("server: %v", err)
+
+	// Shut down cleanly on SIGINT/SIGTERM (systemd sends SIGTERM on stop).
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	go func() {
+		log.Printf("relay listening on %s, upstreams %v", *addr, upstreamURLs)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatalf("server: %v", err)
+		}
+	}()
+
+	<-ctx.Done()
+	log.Printf("shutting down")
+	h.shutdown() // disconnect listeners so their streaming handlers return
+
+	shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := srv.Shutdown(shutCtx); err != nil {
+		log.Printf("graceful shutdown timed out: %v", err)
+		_ = srv.Close()
 	}
 }
 
@@ -70,10 +109,13 @@ func main() {
 type hub struct {
 	client *http.Client
 
-	mu      sync.Mutex
-	subs    map[*subscriber]struct{}
-	cancel  context.CancelFunc // cancels the running upstream pump, if any
-	idle    *time.Timer        // running while there are zero listeners
+	mu        sync.Mutex
+	subs      map[*subscriber]struct{}
+	cancel    context.CancelFunc // cancels the running upstream pump, if any
+	idle      *time.Timer        // running while there are zero listeners
+	connected bool               // true while the upstream is delivering bytes
+	burst     [][]byte           // recent chunks replayed to new listeners
+	burstSize int                // total bytes currently held in burst
 }
 
 type subscriber struct {
@@ -104,6 +146,15 @@ func (h *hub) subscribe() *subscriber {
 	if h.idle != nil {
 		h.idle.Stop()
 		h.idle = nil
+	}
+	// Burst-on-connect: prime the listener with recent audio so playback starts
+	// right away. The channel capacity (subBuffer) far exceeds the burst size,
+	// so these sends never block.
+	for _, b := range h.burst {
+		select {
+		case s.ch <- b:
+		default:
+		}
 	}
 	h.subs[s] = struct{}{}
 	if h.cancel == nil {
@@ -141,6 +192,10 @@ func (h *hub) stopUpstream() {
 	if h.cancel != nil {
 		h.cancel()
 		h.cancel = nil
+		// Drop the burst: after an idle gap it is stale audio that would make a
+		// reviving listener start minutes in the past before jumping to live.
+		h.burst = nil
+		h.burstSize = 0
 		log.Printf("upstream stopped (idle)")
 	}
 }
@@ -159,42 +214,122 @@ func (h *hub) broadcast(b []byte) {
 			s.close()
 		}
 	}
+	// Keep the most recent bytes for burst-on-connect, trimming from the front.
+	h.burst = append(h.burst, b)
+	h.burstSize += len(b)
+	for h.burstSize > burstMax && len(h.burst) > 1 {
+		h.burstSize -= len(h.burst[0])
+		h.burst[0] = nil // let the dropped chunk be collected
+		h.burst = h.burst[1:]
+	}
 }
 
-// pump maintains the single upstream connection for as long as ctx is alive,
-// reconnecting with backoff if the origin drops.
+// setConnected records whether the upstream is currently delivering bytes,
+// for reporting on /healthz.
+func (h *hub) setConnected(v bool) {
+	h.mu.Lock()
+	h.connected = v
+	h.mu.Unlock()
+}
+
+// stats returns the current listener count and upstream state for /healthz.
+func (h *hub) stats() (listeners int, connected bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return len(h.subs), h.connected
+}
+
+// shutdown stops the upstream fetch and disconnects every listener so their
+// (otherwise indefinitely blocked) handlers return. Used on SIGINT/SIGTERM.
+func (h *hub) shutdown() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.idle != nil {
+		h.idle.Stop()
+		h.idle = nil
+	}
+	if h.cancel != nil {
+		h.cancel()
+		h.cancel = nil
+	}
+	for s := range h.subs {
+		delete(h.subs, s)
+		s.close()
+	}
+}
+
+// pump maintains the single upstream connection for as long as ctx is alive.
+//
+// The first attempt is immediate (so listeners don't wait), but every
+// reconnect is paused with exponential backoff + jitter, capped at maxDelay.
+// This matters: an Icecast-style origin throttles an IP that reconnects to the
+// audio mount too quickly, answering further requests with a tarpit (accept,
+// never respond). A tight retry loop both triggers that throttle and keeps it
+// alive, so backing off gently is what lets the origin's cooldown clear.
 func (h *hub) pump(ctx context.Context) {
-	const backoff = 2 * time.Second
+	const (
+		baseDelay = 5 * time.Second
+		maxDelay  = 2 * time.Minute
+	)
+	fails := 0
+	idx := 0
 	for ctx.Err() == nil {
-		if err := h.stream(ctx); err != nil && ctx.Err() == nil {
-			log.Printf("upstream error: %v (retrying in %s)", err, backoff)
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
+		url := upstreamURLs[idx]
+		connected, err := h.stream(ctx, url)
+		if ctx.Err() != nil {
+			return
+		}
+		if connected {
+			fails = 0 // stay on this upstream; it works
+		} else {
+			fails++
+			idx = (idx + 1) % len(upstreamURLs) // fall back to the next upstream
+		}
+		if err != nil {
+			log.Printf("upstream error (%s): %v", url, err)
+		}
+		// Pause before the next attempt. After a successful connection the
+		// pause is just baseDelay (avoids a tight loop if the origin keeps
+		// dropping us); after consecutive failures it grows exponentially.
+		delay := baseDelay
+		if fails > 0 {
+			delay = baseDelay * time.Duration(1<<min(fails-1, 5))
+			if delay > maxDelay {
+				delay = maxDelay
 			}
+		}
+		delay += time.Duration(rand.Int63n(int64(baseDelay)))
+		log.Printf("reconnecting in %s", delay.Round(time.Second))
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return
 		}
 	}
 }
 
 // stream opens one upstream connection and broadcasts its bytes until the
-// origin ends, an error occurs, or ctx is cancelled.
-func (h *hub) stream(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, upstreamURL, nil)
+// origin ends, an error occurs, or ctx is cancelled. The bool reports whether
+// the connection got as far as a 200 response (used to reset retry backoff).
+func (h *hub) stream(ctx context.Context, url string) (bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return false, err
 	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "*/*")
 
 	resp, err := h.client.Do(req)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return errors.New("upstream status " + resp.Status)
+		return false, errors.New("upstream status " + resp.Status)
 	}
-	log.Printf("upstream connected (%s)", resp.Header.Get("Content-Type"))
+	log.Printf("upstream connected: %s (%s)", url, resp.Header.Get("Content-Type"))
+	h.setConnected(true)
+	defer h.setConnected(false)
 
 	buf := make([]byte, chunkSize)
 	for {
@@ -207,9 +342,9 @@ func (h *hub) stream(ctx context.Context) error {
 		}
 		if err != nil {
 			if errors.Is(err, io.EOF) || ctx.Err() != nil {
-				return nil
+				return true, nil
 			}
-			return err
+			return true, err
 		}
 	}
 }

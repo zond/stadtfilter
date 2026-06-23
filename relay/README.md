@@ -12,12 +12,23 @@ so the origin only ever sees one browser-like client regardless of how many
 people are tuned in. When the last listener disconnects, the upstream fetch is
 kept open for a few minutes (`idleTimeout`) and then dropped; the next listener
 revives it. If the origin drops mid-stream while listeners are present, the
-relay reconnects automatically.
+relay reconnects automatically (exponential backoff + jitter, so a throttling
+origin is never hammered). It tries multiple upstream endpoints in order and
+sticks with whichever works, falling back to the next on failure. New listeners
+get a short burst of recent audio on connect so playback starts immediately.
+Shuts down cleanly on SIGTERM.
 
 ## Endpoints
 
 - `GET /` (any path) — the live `audio/mpeg` stream.
-- `GET /healthz` — returns `ok` without touching the upstream.
+- `GET /healthz` — liveness; reports the current listener count and whether the
+  upstream is delivering bytes, without touching the origin. Example:
+
+  ```
+  ok
+  listeners 3
+  upstream up
+  ```
 
 ## Build
 
