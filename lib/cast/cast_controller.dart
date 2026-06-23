@@ -58,9 +58,12 @@ class CastController extends ChangeNotifier {
       device = target;
       deviceIsPlaying = true;
       // Keep the media session active and route its controls to the speaker, so
-      // the notification/lock-screen buttons control the cast.
+      // the notification/lock-screen buttons and the phone's hardware volume
+      // buttons control the cast.
       _handler.onCastPlay = () => toggleDevicePlayPause();
       _handler.onCastPause = () => toggleDevicePlayPause();
+      _handler.onCastAdjustVolume = _adjustVolume;
+      _handler.onCastSetVolume = (v) => setVolume(v);
       _handler.setCasting(active: true, playing: true);
       notifyListeners();
       _loadVolume();
@@ -94,6 +97,8 @@ class CastController extends ChangeNotifier {
     }
   }
 
+  static const _volumeStep = 4;
+
   Future<void> _loadVolume() async {
     final d = device;
     if (d == null || !d.supportsVolume) return;
@@ -101,6 +106,14 @@ class CastController extends ChangeNotifier {
       volume = await _dlna.getVolume(d);
       notifyListeners();
     } catch (_) {}
+    // Route the phone's hardware volume buttons to the speaker.
+    _handler.setRemoteVolume(active: true, volume: volume ?? 50);
+  }
+
+  /// Bumps the speaker volume a step up/down (from the hardware buttons).
+  void _adjustVolume(int direction) {
+    if (direction == 0) return;
+    setVolume((volume ?? 50) + direction.sign * _volumeStep);
   }
 
   /// Sets the speaker volume (0–100).
@@ -108,6 +121,8 @@ class CastController extends ChangeNotifier {
     final d = device;
     if (d == null) return;
     volume = value.clamp(0, 100);
+    // Keep the system volume bar in sync with the speaker.
+    _handler.setRemoteVolume(active: true, volume: volume!);
     notifyListeners();
     try {
       await _dlna.setVolume(d, volume!);
@@ -122,6 +137,9 @@ class CastController extends ChangeNotifier {
     volume = null;
     _handler.onCastPlay = null;
     _handler.onCastPause = null;
+    _handler.onCastAdjustVolume = null;
+    _handler.onCastSetVolume = null;
+    _handler.setRemoteVolume(active: false); // back to phone volume
     _handler.setCasting(active: false, playing: false);
     notifyListeners();
     if (d != null) {

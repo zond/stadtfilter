@@ -185,14 +185,21 @@ class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
 
   // ---- Casting -------------------------------------------------------------
   // While casting to a speaker, the phone's own player is paused, but we still
-  // report a *playing* state to audio_service. That keeps the media foreground
-  // service + partial wake lock alive so the relay server keeps running with
-  // the screen off, and routes the notification/lock-screen controls to the
-  // speaker via [onCastPlay] / [onCastPause].
+  // report a *playing* state to audio_service. That keeps the media session
+  // active so the notification/lock-screen controls (via [onCastPlay] /
+  // [onCastPause]) and the phone's hardware volume buttons (via
+  // [onCastAdjustVolume] / [onCastSetVolume]) drive the speaker.
 
   bool _casting = false;
   Future<void> Function()? onCastPlay;
   Future<void> Function()? onCastPause;
+
+  /// Called when the hardware volume buttons are pressed while casting.
+  /// [direction] is -1 (down), 0 or +1 (up).
+  void Function(int direction)? onCastAdjustVolume;
+
+  /// Called when the system sets an absolute remote volume (0–100).
+  void Function(int volume)? onCastSetVolume;
 
   void setCasting({required bool active, required bool playing}) {
     _casting = active;
@@ -209,6 +216,29 @@ class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
       // Resume reflecting the local player's real state.
       _emitState();
     }
+  }
+
+  /// Switches the media session between phone (local) volume and speaker
+  /// (remote) volume, so the hardware volume buttons control whichever is
+  /// actually playing.
+  void setRemoteVolume({required bool active, int volume = 50}) {
+    androidPlaybackInfo.add(active
+        ? RemoteAndroidPlaybackInfo(
+            volumeControlType: AndroidVolumeControlType.absolute,
+            maxVolume: 100,
+            volume: volume.clamp(0, 100),
+          )
+        : LocalAndroidPlaybackInfo());
+  }
+
+  @override
+  Future<void> androidAdjustRemoteVolume(AndroidVolumeDirection direction) async {
+    onCastAdjustVolume?.call(direction.index);
+  }
+
+  @override
+  Future<void> androidSetRemoteVolume(int volumeIndex) async {
+    onCastSetVolume?.call(volumeIndex);
   }
 
   /// True while we want to play but the player isn't producing audio yet.

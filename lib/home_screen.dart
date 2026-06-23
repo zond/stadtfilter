@@ -210,73 +210,28 @@ class _CastingBanner extends StatelessWidget {
         final theme = Theme.of(context);
         return Padding(
           padding: const EdgeInsets.only(top: 16),
-          child: Column(
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.center,
             children: [
-              Row(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  Icon(Icons.cast_connected,
-                      size: 18, color: theme.colorScheme.primary),
-                  const SizedBox(width: 8),
-                  Flexible(
-                    child: Text(
-                      'Über ${cast.device!.name}',
-                      style: theme.textTheme.bodyMedium,
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  const SizedBox(width: 8),
-                  TextButton(
-                    onPressed: cast.disconnect,
-                    child: const Text('Trennen'),
-                  ),
-                ],
+              Icon(Icons.cast_connected,
+                  size: 18, color: theme.colorScheme.primary),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  'Über ${cast.device!.name}',
+                  style: theme.textTheme.bodyMedium,
+                  overflow: TextOverflow.ellipsis,
+                ),
               ),
-              if (cast.supportsVolume && cast.volume != null)
-                _VolumeSlider(cast: cast),
+              const SizedBox(width: 8),
+              TextButton(
+                onPressed: cast.disconnect,
+                child: const Text('Trennen'),
+              ),
             ],
           ),
         );
       },
-    );
-  }
-}
-
-class _VolumeSlider extends StatefulWidget {
-  final CastController cast;
-
-  const _VolumeSlider({required this.cast});
-
-  @override
-  State<_VolumeSlider> createState() => _VolumeSliderState();
-}
-
-class _VolumeSliderState extends State<_VolumeSlider> {
-  // Local value while dragging, so the thumb is smooth and we only push the
-  // volume to the speaker on release (not on every pixel).
-  double? _dragging;
-
-  @override
-  Widget build(BuildContext context) {
-    final value =
-        (_dragging ?? widget.cast.volume?.toDouble() ?? 0).clamp(0, 100).toDouble();
-    return Row(
-      children: [
-        const Icon(Icons.volume_down, size: 20),
-        Expanded(
-          child: Slider(
-            min: 0,
-            max: 100,
-            value: value,
-            onChanged: (v) => setState(() => _dragging = v),
-            onChangeEnd: (v) {
-              widget.cast.setVolume(v.round());
-              setState(() => _dragging = null);
-            },
-          ),
-        ),
-        const Icon(Icons.volume_up, size: 20),
-      ],
     );
   }
 }

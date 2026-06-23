@@ -169,13 +169,16 @@ class DlnaService {
         final type = service.getElement('serviceType')?.innerText ?? '';
         final control = service.getElement('controlURL')?.innerText;
         if (control == null || control.isEmpty) continue;
-        if (type.contains('AVTransport')) {
+        if (type.contains(':AVTransport:')) {
           avTransport = base.resolve(control);
-        } else if (type.contains('RenderingControl')) {
+        } else if (type.contains(':RenderingControl:')) {
+          // Match the per-player RenderingControl, NOT Sonos's
+          // GroupRenderingControl (which has no Get/SetVolume).
           renderingControl = base.resolve(control);
         }
       }
       if (avTransport == null) return null; // not something we can drive
+      debugPrint('[dlna] "${name.trim()}" av=$avTransport rc=$renderingControl');
 
       return DlnaRenderer(
         name: name.trim(),
@@ -216,8 +219,10 @@ class DlnaService {
           body: body,
         )
         .timeout(const Duration(seconds: 6));
+    debugPrint('[dlna] $action ${args.values.join(",")} '
+        '-> HTTP ${res.statusCode} @ $controlUrl');
     if (res.statusCode >= 400) {
-      debugPrint('[dlna] $action -> HTTP ${res.statusCode}: '
+      debugPrint('[dlna] $action fault: '
           '${res.body.replaceAll(RegExp(r"\s+"), " ").trim()}');
       throw Exception('UPnP $action failed (${res.statusCode})');
     }
