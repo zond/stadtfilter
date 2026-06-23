@@ -1,0 +1,30 @@
+[Unit]
+Description=Radio Stadtfilter MP3 relay
+Documentation=https://github.com/zond/stadtfilter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Adjust the path if you install the binary elsewhere.
+ExecStart=/usr/local/bin/stadtfilter-relay -addr :8080
+Restart=always
+RestartSec=5s
+
+# Run as an unprivileged dynamic user; port 8080 needs no privileges.
+DynamicUser=yes
+
+# Hardening — the relay needs nothing but the network.
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+[Install]
+WantedBy=multi-user.target
