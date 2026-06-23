@@ -27,7 +27,6 @@ class MetadataService extends ChangeNotifier {
   Uri? _currentArt;
   final List<Song> _history = [];
   Timer? _timer;
-  int _seededYmd = 0;
 
   MetadataService(this._handler, {http.Client? client})
       : _client = client ?? http.Client();
@@ -47,7 +46,8 @@ class MetadataService extends ChangeNotifier {
 
   /// Begin seeding + polling. Safe to call once.
   Future<void> start() async {
-    await _seedFromTrackservice();
+    await _refreshHistory();
+    _emitChanged();
     await _poll();
     _timer ??= Timer.periodic(_pollInterval, (_) => _poll());
   }
@@ -59,30 +59,40 @@ class MetadataService extends ChangeNotifier {
     super.dispose();
   }
 
-  // ---- Seeding -------------------------------------------------------------
+  // ---- History (authoritative source) -------------------------------------
 
-  /// Loads today's broadcast-day playlist (with timestamps) into the history.
-  Future<void> _seedFromTrackservice() async {
-    final now = DateTime.now();
-    final ymd = int.parse(DateFormat('yyyyMMdd').format(now));
+  /// Loads the broadcast-day playlist into the history. The trackservice is the
+  /// authoritative source for the list: it gives clean "Artist - Title" entries
+  /// with real timestamps and — unlike the now-playing string — never carries
+  /// the show name. The list is therefore built only from here, never from the
+  /// live now-playing value.
+  Future<void> _refreshHistory() async {
     try {
       final res = await _client.post(
         Uri.parse(_trackserviceUrl),
         headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-        body: {'Datum': ymd.toString(), 'submit': 'submit'},
+        body: {'Datum': _broadcastYmd(), 'submit': 'submit'},
       ).timeout(const Duration(seconds: 12));
       if (res.statusCode != 200) return;
-      final seeded = _parseTrackservice(res.body);
-      if (seeded.isEmpty) return;
+      final played = _parseTrackservice(res.body);
+      if (played.isEmpty) return;
       // Trackservice is chronological (oldest first); we want newest first.
+      // The newest entry is the currently-playing track; we intentionally keep
+      // it in the list (it just shows up top with its start time).
       _history
         ..clear()
-        ..addAll(seeded.reversed);
-      _seededYmd = ymd;
-      _emitChanged();
+        ..addAll(played.reversed);
     } catch (_) {
-      // Best effort: history simply starts empty and grows live.
+      // Best effort: keep whatever history we already have.
     }
+  }
+
+  /// The broadcast day runs 02:00–01:59, so before 02:00 we still want the
+  /// previous calendar day's list.
+  String _broadcastYmd() {
+    var d = DateTime.now();
+    if (d.hour < 2) d = d.subtract(const Duration(days: 1));
+    return DateFormat('yyyyMMdd').format(d);
   }
 
   /// Parses lines of the form `2026-06-22 03:42  Artist - Title<br>`.
@@ -105,36 +115,19 @@ class MetadataService extends ChangeNotifier {
   // ---- Live polling --------------------------------------------------------
 
   Future<void> _poll() async {
-    // Re-seed once per broadcast day so timestamps stay correct over midnight.
-    final ymd = int.parse(DateFormat('yyyyMMdd').format(DateTime.now()));
-    if (ymd != _seededYmd && _seededYmd != 0) {
-      await _seedFromTrackservice();
-    }
-
     final raw = await _fetchSong();
     if (raw == null || raw.isEmpty) return;
     final next = Song.parse(raw, playedAt: DateTime.now());
 
-    if (_current == null) {
-      _current = next;
-      // Avoid showing the current track twice if it's already at the top.
-      if (_history.isNotEmpty && _history.first.sameTrack(next)) {
-        _history.removeAt(0);
-      }
-      _updateArt();
-      _handler.updateNowPlaying(next, artUri: _currentArt);
-      _emitChanged();
-      return;
-    }
+    if (_current != null && _current!.display == next.display) return;
 
-    if (!_current!.sameTrack(next)) {
-      // The previous track just finished — push it onto the history.
-      _history.insert(0, _current!);
-      _current = next;
-      _updateArt();
-      _handler.updateNowPlaying(next, artUri: _currentArt);
-      _emitChanged();
-    }
+    // The now-playing track changed.
+    _current = next;
+    _updateArt();
+    _handler.updateNowPlaying(next, artUri: _currentArt);
+    // …which means the playlist changed too — pull the fresh, clean list.
+    await _refreshHistory();
+    _emitChanged();
   }
 
   Future<String?> _fetchSong() async {
