@@ -38,6 +38,7 @@ dependencies:
   audio_service: ^0.18.18
   http: ^1.6.0
   intl: ^0.20.2
+  xml: ^6.6.1
 
 dev_dependencies:
   flutter_test:

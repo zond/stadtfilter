@@ -1,4 +1,5 @@
 import 'package:audio_service/audio_service.dart';
+import 'package:flutter/foundation.dart';
 import 'package:intl/intl.dart';
 import 'package:just_audio/just_audio.dart';
 
@@ -45,11 +46,15 @@ class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
     // Publish a sensible initial MediaItem so something shows before the
     // first metadata poll completes.
     mediaItem.add(_liveItem(const Song(artist: 'Radio Stadtfilter', title: 'Live')));
-    _player.playbackEventStream.listen(_broadcastState, onError: (Object e, _) {
-      // Surface fatal errors as an idle/errored state instead of crashing.
-      _broadcastState(_player.playbackEvent);
+    _player.playbackEventStream.listen((_) => _emitState(), onError: (_, _) {
+      _emitState();
     });
   }
+
+  /// Whether the user currently wants playback. The button/notification reflect
+  /// this intent immediately, so taps feel instant even when the stream is
+  /// stalling and the player isn't emitting timely state events.
+  bool _wantPlaying = false;
 
   /// Whether the live stream has been wired up to the player yet. We load
   /// lazily on the first [play] so a stale buffered connection is never torn
@@ -144,6 +149,9 @@ class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
 
   @override
   Future<void> play() async {
+    if (_casting) return onCastPlay?.call() ?? Future.value();
+    _wantPlaying = true;
+    _emitState(); // instant: pause icon + buffering spinner
     try {
       await _ensureSource();
       await _player.play();
@@ -151,14 +159,27 @@ class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
       // A failed connection (e.g. no network) leaves the source unloaded so
       // the next play attempt reconnects from scratch.
       _sourceLoaded = false;
+      _wantPlaying = false;
+      _emitState();
     }
   }
 
   @override
-  Future<void> pause() => _player.pause();
+  Future<void> pause() async {
+    if (_casting) return onCastPause?.call() ?? Future.value();
+    // For a live stream, "pause" tears the connection down. A soft pause can
+    // hang when the stream has stalled (there's nothing buffered to pause);
+    // stopping releases the player and kills the HTTP connection immediately.
+    // Resuming reconnects to live via [play] -> [_ensureSource].
+    _wantPlaying = false;
+    _sourceLoaded = false;
+    _emitState(); // instant: play icon, no spinner
+    await _player.stop();
+  }
 
   @override
   Future<void> stop() async {
+    if (_casting) return onCastPause?.call() ?? Future.value();
     await _player.stop();
     _sourceLoaded = false;
     await super.stop();
@@ -168,25 +189,56 @@ class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
   @override
   Future<void> seek(Duration position) async {}
 
-  void _broadcastState(PlaybackEvent event) {
-    final playing = _player.playing;
+  // ---- Casting -------------------------------------------------------------
+  // While casting to a speaker, the phone's own player is paused, but we still
+  // report a *playing* state to audio_service. That keeps the media foreground
+  // service + partial wake lock alive so the relay server keeps running with
+  // the screen off, and routes the notification/lock-screen controls to the
+  // speaker via [onCastPlay] / [onCastPause].
+
+  bool _casting = false;
+  Future<void> Function()? onCastPlay;
+  Future<void> Function()? onCastPause;
+
+  void setCasting({required bool active, required bool playing}) {
+    _casting = active;
+    if (active) {
+      buffering.value = false;
+      playbackState.add(playbackState.value.copyWith(
+        controls: [if (playing) MediaControl.pause else MediaControl.play],
+        systemActions: const {MediaAction.play, MediaAction.pause},
+        androidCompactActionIndices: const [0],
+        processingState: AudioProcessingState.ready,
+        playing: playing,
+      ));
+    } else {
+      // Resume reflecting the local player's real state.
+      _emitState();
+    }
+  }
+
+  /// True while we want to play but the player isn't producing audio yet.
+  /// The phone UI uses this for its spinner. We deliberately do NOT report
+  /// STATE_BUFFERING to the media session, because Android Auto renders that as
+  /// a non-tappable spinner — keeping the session at a plain play/pause state
+  /// means the Auto button stays tappable so a slow connect can be cancelled.
+  final ValueNotifier<bool> buffering = ValueNotifier<bool>(false);
+
+  void _emitState() {
+    // While casting, the playback state is driven by [setCasting] instead.
+    if (_casting) return;
+    final ready = _player.processingState == ProcessingState.ready ||
+        _player.processingState == ProcessingState.completed;
+    buffering.value = _wantPlaying && !ready;
     playbackState.add(playbackState.value.copyWith(
       // Only play/pause — no stop button.
-      controls: [if (playing) MediaControl.pause else MediaControl.play],
+      controls: [if (_wantPlaying) MediaControl.pause else MediaControl.play],
       systemActions: const {MediaAction.play, MediaAction.pause},
       androidCompactActionIndices: const [0],
-      // Never report `idle`: a live stream that hasn't been tapped yet is
-      // "ready to play", not stopped. Reporting an active session makes
-      // Android Auto open straight to the now-playing screen instead of the
-      // (single-item) browse list.
-      processingState: const {
-        ProcessingState.idle: AudioProcessingState.ready,
-        ProcessingState.loading: AudioProcessingState.loading,
-        ProcessingState.buffering: AudioProcessingState.buffering,
-        ProcessingState.ready: AudioProcessingState.ready,
-        ProcessingState.completed: AudioProcessingState.ready,
-      }[_player.processingState]!,
-      playing: playing,
+      // Always a settled play/pause state (never STATE_BUFFERING) so the Auto
+      // button stays tappable while connecting.
+      processingState: AudioProcessingState.ready,
+      playing: _wantPlaying,
       updatePosition: _player.position,
       bufferedPosition: _player.bufferedPosition,
       speed: _player.speed,

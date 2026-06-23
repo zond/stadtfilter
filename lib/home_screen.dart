@@ -3,14 +3,21 @@ import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
 import 'audio_player_handler.dart';
+import 'cast/cast_controller.dart';
 import 'metadata_service.dart';
 import 'models/song.dart';
 
 class HomeScreen extends StatelessWidget {
   final AudioPlayerHandler handler;
   final MetadataService metadata;
+  final CastController cast;
 
-  const HomeScreen({super.key, required this.handler, required this.metadata});
+  const HomeScreen({
+    super.key,
+    required this.handler,
+    required this.metadata,
+    required this.cast,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -18,10 +25,11 @@ class HomeScreen extends StatelessWidget {
       appBar: AppBar(
         title: const Text('Radio Stadtfilter'),
         centerTitle: true,
+        actions: [_CastButton(cast: cast)],
       ),
       body: Column(
         children: [
-          _NowPlaying(handler: handler, metadata: metadata),
+          _NowPlaying(handler: handler, metadata: metadata, cast: cast),
           const Divider(height: 1),
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 4),
@@ -38,11 +46,37 @@ class HomeScreen extends StatelessWidget {
   }
 }
 
+class _CastButton extends StatelessWidget {
+  final CastController cast;
+
+  const _CastButton({required this.cast});
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: cast,
+      builder: (context, _) {
+        return IconButton(
+          tooltip: 'Auf Lautsprecher abspielen',
+          icon: Icon(cast.isCasting ? Icons.cast_connected : Icons.cast),
+          color: cast.isCasting ? Theme.of(context).colorScheme.primary : null,
+          onPressed: () => showCastSheet(context, cast),
+        );
+      },
+    );
+  }
+}
+
 class _NowPlaying extends StatelessWidget {
   final AudioPlayerHandler handler;
   final MetadataService metadata;
+  final CastController cast;
 
-  const _NowPlaying({required this.handler, required this.metadata});
+  const _NowPlaying({
+    required this.handler,
+    required this.metadata,
+    required this.cast,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -78,7 +112,8 @@ class _NowPlaying extends StatelessWidget {
             },
           ),
           const SizedBox(height: 24),
-          _PlayButton(handler: handler),
+          _PlayButton(handler: handler, cast: cast),
+          _CastingBanner(cast: cast),
         ],
       ),
     );
@@ -87,46 +122,242 @@ class _NowPlaying extends StatelessWidget {
 
 class _PlayButton extends StatelessWidget {
   final AudioPlayerHandler handler;
+  final CastController cast;
 
-  const _PlayButton({required this.handler});
+  const _PlayButton({required this.handler, required this.cast});
 
   @override
   Widget build(BuildContext context) {
-    return StreamBuilder<PlaybackState>(
-      stream: handler.playbackState,
-      builder: (context, snapshot) {
-        final state = snapshot.data;
-        final playing = state?.playing ?? false;
-        final processing = state?.processingState;
-        final busy = processing == AudioProcessingState.loading ||
-            processing == AudioProcessingState.buffering;
-
-        return SizedBox(
-          width: 88,
-          height: 88,
-          child: Material(
-            color: Theme.of(context).colorScheme.primary,
-            shape: const CircleBorder(),
-            child: InkWell(
-              customBorder: const CircleBorder(),
-              onTap: () => playing ? handler.pause() : handler.play(),
-              child: busy
-                  ? const Padding(
-                      padding: EdgeInsets.all(28),
-                      child: CircularProgressIndicator(
-                          strokeWidth: 3, color: Colors.white),
-                    )
-                  : Icon(
-                      playing ? Icons.pause : Icons.play_arrow,
-                      size: 52,
-                      color: Colors.white,
-                    ),
-            ),
+    return AnimatedBuilder(
+      animation: cast,
+      builder: (context, _) {
+        // While casting, the button controls the speaker; otherwise the phone.
+        if (cast.isCasting) {
+          return _circleButton(
+            context,
+            icon: cast.deviceIsPlaying ? Icons.pause : Icons.play_arrow,
+            onTap: cast.toggleDevicePlayPause,
+          );
+        }
+        // Spinner comes from the handler's buffering signal (the media session
+        // itself stays at a plain play/pause state for Android Auto's sake).
+        return ValueListenableBuilder<bool>(
+          valueListenable: handler.buffering,
+          builder: (context, busy, _) => StreamBuilder<PlaybackState>(
+            stream: handler.playbackState,
+            builder: (context, snapshot) {
+              final playing = snapshot.data?.playing ?? false;
+              return _circleButton(
+                context,
+                icon: playing ? Icons.pause : Icons.play_arrow,
+                busy: busy,
+                onTap: () => playing ? handler.pause() : handler.play(),
+              );
+            },
           ),
         );
       },
     );
   }
+
+  Widget _circleButton(
+    BuildContext context, {
+    required IconData icon,
+    required VoidCallback onTap,
+    bool busy = false,
+  }) {
+    return SizedBox(
+      width: 88,
+      height: 88,
+      child: Material(
+        color: Theme.of(context).colorScheme.primary,
+        shape: const CircleBorder(),
+        child: InkWell(
+          customBorder: const CircleBorder(),
+          // Stay tappable while buffering so the user can always stop a stalled
+          // stream; the spinner is just an overlay ring.
+          onTap: onTap,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              if (busy)
+                const SizedBox(
+                  width: 78,
+                  height: 78,
+                  child: CircularProgressIndicator(
+                      strokeWidth: 3, color: Colors.white70),
+                ),
+              Icon(icon, size: 52, color: Colors.white),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _CastingBanner extends StatelessWidget {
+  final CastController cast;
+
+  const _CastingBanner({required this.cast});
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: cast,
+      builder: (context, _) {
+        if (!cast.isCasting) return const SizedBox.shrink();
+        final theme = Theme.of(context);
+        return Padding(
+          padding: const EdgeInsets.only(top: 16),
+          child: Column(
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Icon(Icons.cast_connected,
+                      size: 18, color: theme.colorScheme.primary),
+                  const SizedBox(width: 8),
+                  Flexible(
+                    child: Text(
+                      'Über ${cast.device!.name}',
+                      style: theme.textTheme.bodyMedium,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton(
+                    onPressed: cast.disconnect,
+                    child: const Text('Trennen'),
+                  ),
+                ],
+              ),
+              if (cast.supportsVolume && cast.volume != null)
+                _VolumeSlider(cast: cast),
+            ],
+          ),
+        );
+      },
+    );
+  }
+}
+
+class _VolumeSlider extends StatefulWidget {
+  final CastController cast;
+
+  const _VolumeSlider({required this.cast});
+
+  @override
+  State<_VolumeSlider> createState() => _VolumeSliderState();
+}
+
+class _VolumeSliderState extends State<_VolumeSlider> {
+  // Local value while dragging, so the thumb is smooth and we only push the
+  // volume to the speaker on release (not on every pixel).
+  double? _dragging;
+
+  @override
+  Widget build(BuildContext context) {
+    final value =
+        (_dragging ?? widget.cast.volume?.toDouble() ?? 0).clamp(0, 100).toDouble();
+    return Row(
+      children: [
+        const Icon(Icons.volume_down, size: 20),
+        Expanded(
+          child: Slider(
+            min: 0,
+            max: 100,
+            value: value,
+            onChanged: (v) => setState(() => _dragging = v),
+            onChangeEnd: (v) {
+              widget.cast.setVolume(v.round());
+              setState(() => _dragging = null);
+            },
+          ),
+        ),
+        const Icon(Icons.volume_up, size: 20),
+      ],
+    );
+  }
+}
+
+/// Bottom sheet that discovers speakers and lets the user pick one (or stop).
+void showCastSheet(BuildContext context, CastController cast) {
+  cast.discover();
+  showModalBottomSheet<void>(
+    context: context,
+    showDragHandle: true,
+    builder: (context) => AnimatedBuilder(
+      animation: cast,
+      builder: (context, _) {
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 8, 4),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Text('Auf Lautsprecher abspielen',
+                          style: Theme.of(context).textTheme.titleMedium),
+                    ),
+                    IconButton(
+                      tooltip: 'Erneut suchen',
+                      icon: cast.isDiscovering
+                          ? const SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2))
+                          : const Icon(Icons.refresh),
+                      onPressed: cast.isDiscovering ? null : cast.discover,
+                    ),
+                  ],
+                ),
+              ),
+              if (cast.isCasting)
+                ListTile(
+                  leading: Icon(Icons.cast_connected,
+                      color: Theme.of(context).colorScheme.primary),
+                  title: Text(cast.device!.name),
+                  subtitle: const Text('Verbunden'),
+                  trailing: TextButton(
+                    onPressed: () {
+                      cast.disconnect();
+                      Navigator.of(context).pop();
+                    },
+                    child: const Text('Trennen'),
+                  ),
+                ),
+              if (cast.error != null)
+                Padding(
+                  padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+                  child: Text(cast.error!,
+                      style: TextStyle(color: Theme.of(context).colorScheme.error)),
+                ),
+              if (cast.isDiscovering && cast.devices.isEmpty)
+                const Padding(
+                  padding: EdgeInsets.all(24),
+                  child: Center(child: Text('Suche Lautsprecher…')),
+                ),
+              for (final d in cast.devices)
+                ListTile(
+                  leading: const Icon(Icons.speaker),
+                  title: Text(d.name),
+                  selected: cast.device == d,
+                  onTap: () {
+                    cast.castTo(d);
+                    Navigator.of(context).pop();
+                  },
+                ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    ),
+  );
 }
 
 class _History extends StatelessWidget {

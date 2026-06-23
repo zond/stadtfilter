@@ -2,11 +2,13 @@ import 'package:audio_service/audio_service.dart';
 import 'package:flutter/material.dart';
 
 import 'audio_player_handler.dart';
+import 'cast/cast_controller.dart';
 import 'home_screen.dart';
 import 'metadata_service.dart';
 
 late final AudioPlayerHandler audioHandler;
 late final MetadataService metadataService;
+late final CastController castController;
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -26,20 +28,28 @@ Future<void> main() async {
   // Fire-and-forget; the UI listens for updates.
   metadataService.start();
 
+  castController = CastController(
+    audioHandler,
+    nowPlaying: () => metadataService.current?.display,
+  );
+
   runApp(StadtfilterApp(
     handler: audioHandler,
     metadata: metadataService,
+    cast: castController,
   ));
 }
 
 class StadtfilterApp extends StatelessWidget {
   final AudioPlayerHandler handler;
   final MetadataService metadata;
+  final CastController cast;
 
   const StadtfilterApp({
     super.key,
     required this.handler,
     required this.metadata,
+    required this.cast,
   });
 
   @override
@@ -54,7 +64,7 @@ class StadtfilterApp extends StatelessWidget {
         ),
         useMaterial3: true,
       ),
-      home: HomeScreen(handler: handler, metadata: metadata),
+      home: HomeScreen(handler: handler, metadata: metadata, cast: cast),
     );
   }
 }
