@@ -2,21 +2,21 @@ import 'package:flutter/foundation.dart';
 
 import '../audio_player_handler.dart';
 import 'dlna.dart';
-import 'stream_relay_server.dart';
 
-/// Coordinates "casting" the stream to a network speaker: runs the local relay,
-/// discovers DLNA renderers, and drives playback on the chosen device while
+/// Coordinates "casting" the stream to a network speaker: discovers DLNA
+/// renderers and tells the chosen one to play the relay URL directly, while
 /// pausing playback on the phone.
+///
+/// Because the speaker streams straight from the relay (not via the phone), the
+/// phone is not in the audio path — it only sends control commands. It can even
+/// sleep; the speaker keeps playing.
 class CastController extends ChangeNotifier {
   final AudioPlayerHandler _handler;
   final DlnaService _dlna = DlnaService();
-  final StreamRelayServer _relay = StreamRelayServer();
 
-  /// [nowPlaying] supplies the live "Artist – Title" so the relay can show it
-  /// on speakers via ICY metadata.
-  CastController(this._handler, {String? Function()? nowPlaying}) {
-    _relay.nowPlaying = nowPlaying;
-  }
+  CastController(this._handler);
+
+  static final Uri _streamUri = Uri.parse(kStreamUrl);
 
   bool isDiscovering = false;
   List<DlnaRenderer> devices = const [];
@@ -36,8 +36,11 @@ class CastController extends ChangeNotifier {
     notifyListeners();
     try {
       devices = await _dlna.discover();
+      debugPrint('[cast] discover: ${devices.length} device(s) '
+          '${devices.map((d) => "${d.name}${d.supportsVolume ? "+vol" : ""}").toList()}');
       if (devices.isEmpty) error = 'Keine Lautsprecher gefunden';
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[cast] discover error: $e');
       devices = const [];
       error = 'Suche fehlgeschlagen';
     }
@@ -48,56 +51,42 @@ class CastController extends ChangeNotifier {
   Future<void> castTo(DlnaRenderer target) async {
     error = null;
     try {
-      final url = await _relay.start();
-      if (url == null) {
-        error = 'Kein WLAN gefunden';
-        notifyListeners();
-        return;
-      }
+      debugPrint('[cast] castTo "${target.name}" control=${target.controlUrl}');
       await _handler.pause(); // hand audio over to the speaker
-      await _dlna.playStream(target, url);
+      await _dlna.playStream(target, _streamUri);
+      debugPrint('[cast] playStream ok on "${target.name}"');
       device = target;
       deviceIsPlaying = true;
-      // Route notification/lock-screen controls to the speaker and keep the
-      // foreground service (and its wake lock) alive so the relay survives the
-      // screen turning off.
+      // Keep the media session active and route its controls to the speaker, so
+      // the notification/lock-screen buttons control the cast.
       _handler.onCastPlay = () => toggleDevicePlayPause();
       _handler.onCastPause = () => toggleDevicePlayPause();
       _handler.setCasting(active: true, playing: true);
       notifyListeners();
       _loadVolume();
-    } catch (_) {
+    } catch (e) {
+      debugPrint('[cast] castTo error: $e');
       error = 'Verbindung zu ${target.name} fehlgeschlagen';
-      await _relay.stop();
       device = null;
       notifyListeners();
     }
   }
 
-  /// Play/pause on the speaker while casting. Pause tears the relay (and its
-  /// upstream HTTP fetch) down — a soft UPnP pause can do nothing when the
-  /// stream has stalled — and play restarts it from live.
+  /// Play/pause on the speaker while casting. For a live stream we stop on pause
+  /// and re-point the speaker at the relay on play (so it resumes at "live").
   Future<void> toggleDevicePlayPause() async {
     final d = device;
     if (d == null) return;
     if (deviceIsPlaying) {
-      // Reflect "stopped" immediately so the UI is responsive, then tear down.
       deviceIsPlaying = false;
       _handler.setCasting(active: true, playing: false);
       notifyListeners();
-      await _relay.stop(); // aborts the upstream fetch / speaker connection
       try {
         await _dlna.stop(d);
       } catch (_) {}
     } else {
       try {
-        final url = await _relay.start();
-        if (url == null) {
-          error = 'Kein WLAN gefunden';
-          notifyListeners();
-          return;
-        }
-        await _dlna.playStream(d, url);
+        await _dlna.playStream(d, _streamUri);
         deviceIsPlaying = true;
         _handler.setCasting(active: true, playing: true);
         notifyListeners();
@@ -140,12 +129,10 @@ class CastController extends ChangeNotifier {
         await _dlna.stop(d);
       } catch (_) {}
     }
-    await _relay.stop();
   }
 
   @override
   void dispose() {
-    _relay.stop();
     _dlna.dispose();
     super.dispose();
   }

@@ -5,15 +5,13 @@ import 'package:just_audio/just_audio.dart';
 
 import 'models/song.dart';
 
-/// The live MP3 stream of Radio Stadtfilter.
-const String kStreamUrl = 'https://streamer.stadtfilter.net/stadtfilter.mp3';
-
-/// The stream server only serves data to browser-like clients — requests with
-/// the default Android/ExoPlayer User-Agent are accepted but never sent any
-/// bytes (the player hangs in "loading"). A browser UA makes it stream.
-const String kStreamUserAgent =
-    'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 '
-    '(KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36';
+/// The live MP3 stream, served by our relay (see the `relay/` directory).
+///
+/// The relay fetches the origin (`streamer.stadtfilter.net`) with a browser
+/// User-Agent — which the origin requires — and re-serves the bytes to anyone.
+/// That means the app can play this URL natively: no per-request User-Agent,
+/// no just_audio proxy, and speakers can fetch it directly when casting.
+const String kStreamUrl = 'http://micro.oort.se:8080/';
 
 /// Station logo used as default media artwork (shown on the lock screen,
 /// notification and Android Auto).
@@ -24,14 +22,10 @@ final Uri kDefaultArtUri =
 /// controlled through the system media session: notification, lock screen,
 /// headset/steering-wheel buttons and Android Auto.
 class AudioPlayerHandler extends BaseAudioHandler with SeekHandler {
-  // The stream server only answers browser-like clients, and it does NOT
-  // respond to media3's native HttpURLConnection request at all (it hangs).
-  // just_audio's request-header proxy uses Dart's HttpClient, which the server
-  // *does* answer, so we route through it (the default) and let it carry our
-  // browser User-Agent. The load control starts playback after a short buffer
-  // rather than building a large one first, to keep startup snappy.
+  // The relay serves a plain stream, so the player connects natively (no
+  // User-Agent / proxy needed). The load control starts playback after a short
+  // buffer rather than building a large one first, to keep startup snappy.
   final AudioPlayer _player = AudioPlayer(
-    userAgent: kStreamUserAgent,
     audioLoadConfiguration: const AudioLoadConfiguration(
       androidLoadControl: AndroidLoadControl(
         minBufferDuration: Duration(seconds: 5),

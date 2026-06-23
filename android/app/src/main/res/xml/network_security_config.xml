@@ -1,11 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Cleartext (http) is needed for two local-network purposes:
-    * just_audio's request-header proxy on 127.0.0.1, and
-    * UPnP/DLNA control of speakers (Sonos, WiiM) on the LAN, which use http.
-  All remote traffic (the stream + metadata) uses https:// URLs and stays
-  encrypted regardless of this setting.
+  The stream relay (see the relay/ directory) is served over plain HTTP, so we
+  permit cleartext to that host only. Everything else (metadata endpoints,
+  artwork) uses https:// and stays encrypted.
 -->
 <network-security-config>
-    <base-config cleartextTrafficPermitted="true"/>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="true">micro.oort.se</domain>
+    </domain-config>
 </network-security-config>

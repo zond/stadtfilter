@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' as http;
 import 'package:xml/xml.dart';
 
@@ -63,6 +64,7 @@ class DlnaService {
     }
     await Future<void>.delayed(timeout);
     socket.close();
+    debugPrint('[dlna] SSDP returned ${locations.length} location(s)');
 
     final renderers = <String, DlnaRenderer>{};
     await Future.wait(locations.map((loc) async {
@@ -215,6 +217,8 @@ class DlnaService {
         )
         .timeout(const Duration(seconds: 6));
     if (res.statusCode >= 400) {
+      debugPrint('[dlna] $action -> HTTP ${res.statusCode}: '
+          '${res.body.replaceAll(RegExp(r"\s+"), " ").trim()}');
       throw Exception('UPnP $action failed (${res.statusCode})');
     }
     try {

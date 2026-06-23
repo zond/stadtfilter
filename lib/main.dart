@@ -28,10 +28,7 @@ Future<void> main() async {
   // Fire-and-forget; the UI listens for updates.
   metadataService.start();
 
-  castController = CastController(
-    audioHandler,
-    nowPlaying: () => metadataService.current?.display,
-  );
+  castController = CastController(audioHandler);
 
   runApp(StadtfilterApp(
     handler: audioHandler,
