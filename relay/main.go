@@ -9,9 +9,16 @@
 // the origin only ever sees one browser-like client regardless of how many
 // people are tuned in. When the last listener leaves, the upstream fetch is
 // kept alive for idleTimeout and then dropped; the next listener revives it.
+//
+// ICY metadata: the relay reads the origin's StreamTitle metadata and strips it
+// from the shared audio, then re-injects it only for listeners that request
+// `Icy-MetaData: 1` (players, Sonos/WiiM). Listeners that don't ask get pure
+// audio, since interleaved metadata bytes would corrupt playback for them.
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -22,6 +29,9 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"regexp"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -116,6 +126,7 @@ type hub struct {
 	connected bool               // true while the upstream is delivering bytes
 	burst     [][]byte           // recent chunks replayed to new listeners
 	burstSize int                // total bytes currently held in burst
+	title     string             // current ICY StreamTitle from the origin
 }
 
 type subscriber struct {
@@ -239,6 +250,24 @@ func (h *hub) stats() (listeners int, connected bool) {
 	return len(h.subs), h.connected
 }
 
+// setTitle records the current ICY StreamTitle parsed from the origin.
+func (h *hub) setTitle(t string) {
+	h.mu.Lock()
+	changed := t != h.title
+	h.title = t
+	h.mu.Unlock()
+	if changed {
+		log.Printf("now playing: %s", t)
+	}
+}
+
+// currentTitle returns the latest ICY StreamTitle.
+func (h *hub) currentTitle() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.title
+}
+
 // shutdown stops the upstream fetch and disconnects every listener so their
 // (otherwise indefinitely blocked) handlers return. Used on SIGINT/SIGTERM.
 func (h *hub) shutdown() {
@@ -318,6 +347,8 @@ func (h *hub) stream(ctx context.Context, url string) (bool, error) {
 	}
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Accept", "*/*")
+	// Ask for ICY metadata so we can track the current song title.
+	req.Header.Set("Icy-MetaData", "1")
 
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -327,26 +358,65 @@ func (h *hub) stream(ctx context.Context, url string) (bool, error) {
 	if resp.StatusCode != http.StatusOK {
 		return false, errors.New("upstream status " + resp.Status)
 	}
-	log.Printf("upstream connected: %s (%s)", url, resp.Header.Get("Content-Type"))
+	metaint := 0
+	if v := resp.Header.Get("icy-metaint"); v != "" {
+		metaint, _ = strconv.Atoi(v)
+	}
+	log.Printf("upstream connected: %s (%s, icy-metaint=%d)", url,
+		resp.Header.Get("Content-Type"), metaint)
 	h.setConnected(true)
 	defer h.setConnected(false)
 
+	// De-interleave: strip the origin's metadata blocks so the fan-out carries
+	// pure audio, updating the current title as it changes. When the origin
+	// sends no ICY metadata (metaint == 0) this is a plain copy.
+	reader := bufio.NewReaderSize(resp.Body, 64*1024)
 	buf := make([]byte, chunkSize)
+	audioLeft := metaint
 	for {
-		n, err := resp.Body.Read(buf)
+		if metaint > 0 && audioLeft == 0 {
+			lenByte, err := reader.ReadByte()
+			if err != nil {
+				return true, ignoreExpected(err, ctx)
+			}
+			if mlen := int(lenByte) * 16; mlen > 0 {
+				meta := make([]byte, mlen)
+				if _, err := io.ReadFull(reader, meta); err != nil {
+					return true, ignoreExpected(err, ctx)
+				}
+				if title := parseStreamTitle(meta); title != "" {
+					h.setTitle(title)
+				}
+			}
+			audioLeft = metaint
+		}
+		toRead := len(buf)
+		if metaint > 0 && audioLeft < toRead {
+			toRead = audioLeft
+		}
+		n, err := reader.Read(buf[:toRead])
 		if n > 0 {
 			// Copy: buf is reused and subscribers read asynchronously.
 			chunk := make([]byte, n)
 			copy(chunk, buf[:n])
 			h.broadcast(chunk)
+			if metaint > 0 {
+				audioLeft -= n
+			}
 		}
 		if err != nil {
-			if errors.Is(err, io.EOF) || ctx.Err() != nil {
-				return true, nil
-			}
-			return true, err
+			return true, ignoreExpected(err, ctx)
 		}
 	}
+}
+
+// ignoreExpected maps EOF / a cancelled context to a nil error (a normal end),
+// and returns anything else unchanged.
+func ignoreExpected(err error, ctx context.Context) error {
+	if errors.Is(err, io.EOF) || ctx.Err() != nil {
+		return nil
+	}
+	return err
 }
 
 // serveStream sends the live audio to a single listener.
@@ -356,10 +426,18 @@ func (h *hub) serveStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Only listeners that ask for ICY get metadata interleaved; everyone else
+	// gets pure audio (metadata bytes would corrupt playback for them).
+	const serveMetaint = 16000
+	wantsIcy := r.Header.Get("Icy-MetaData") == "1"
+
 	w.Header().Set("Content-Type", "audio/mpeg")
 	w.Header().Set("Cache-Control", "no-cache, no-store")
 	w.Header().Set("icy-name", "Radio Stadtfilter")
 	w.Header().Set("Connection", "close")
+	if wantsIcy {
+		w.Header().Set("icy-metaint", strconv.Itoa(serveMetaint))
+	}
 
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
@@ -374,11 +452,15 @@ func (h *hub) serveStream(w http.ResponseWriter, r *http.Request) {
 
 	sub := h.subscribe()
 	defer h.unsubscribe(sub)
-	log.Printf("listener connected: %s", r.RemoteAddr)
+	log.Printf("listener connected: %s (icy=%v)", r.RemoteAddr, wantsIcy)
 	defer log.Printf("listener disconnected: %s", r.RemoteAddr)
 
 	w.WriteHeader(http.StatusOK)
 	flusher.Flush()
+
+	// Per-connection ICY re-interleaving state.
+	counter := 0
+	lastTitle := ""
 
 	for {
 		select {
@@ -388,10 +470,63 @@ func (h *hub) serveStream(w http.ResponseWriter, r *http.Request) {
 			if !ok {
 				return // dropped (too slow) or hub shutting down
 			}
-			if _, err := w.Write(chunk); err != nil {
-				return
+			if !wantsIcy {
+				if _, err := w.Write(chunk); err != nil {
+					return
+				}
+				flusher.Flush()
+				continue
+			}
+			// Emit a metadata block every serveMetaint bytes of audio.
+			data := chunk
+			for len(data) > 0 {
+				take := serveMetaint - counter
+				if len(data) < take {
+					take = len(data)
+				}
+				if _, err := w.Write(data[:take]); err != nil {
+					return
+				}
+				data = data[take:]
+				counter += take
+				if counter < serveMetaint {
+					continue
+				}
+				counter = 0
+				title := h.currentTitle()
+				block := []byte{0} // 0 = no change
+				if title != lastTitle {
+					lastTitle = title
+					block = icyMetaBlock(title)
+				}
+				if _, err := w.Write(block); err != nil {
+					return
+				}
 			}
 			flusher.Flush()
 		}
 	}
+}
+
+var streamTitleRe = regexp.MustCompile(`StreamTitle='(.*?)';`)
+
+// parseStreamTitle extracts the StreamTitle value from an ICY metadata block.
+func parseStreamTitle(meta []byte) string {
+	m := streamTitleRe.FindSubmatch(bytes.TrimRight(meta, "\x00"))
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(string(m[1]))
+}
+
+// icyMetaBlock builds an ICY metadata block: a length byte (in 16-byte units)
+// followed by StreamTitle='…'; padded with NULs to a multiple of 16 bytes.
+func icyMetaBlock(title string) []byte {
+	safe := strings.NewReplacer("'", "", ";", "").Replace(title)
+	payload := []byte("StreamTitle='" + safe + "';")
+	blocks := (len(payload) + 15) / 16
+	out := make([]byte, 1+blocks*16)
+	out[0] = byte(blocks)
+	copy(out[1:], payload)
+	return out
 }

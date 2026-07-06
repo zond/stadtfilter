@@ -18,9 +18,15 @@ sticks with whichever works, falling back to the next on failure. New listeners
 get a short burst of recent audio on connect so playback starts immediately.
 Shuts down cleanly on SIGTERM.
 
+Listeners that send `Icy-MetaData: 1` (media players, Sonos/WiiM) receive the
+live `StreamTitle` interleaved into the stream (`icy-metaint: 16000`); everyone
+else gets pure audio, since the metadata bytes would corrupt playback for a
+client that isn't expecting them.
+
 ## Endpoints
 
-- `GET /` (any path) — the live `audio/mpeg` stream.
+- `GET /` (any path) — the live `audio/mpeg` stream. Send `Icy-MetaData: 1` for
+  interleaved `StreamTitle` metadata.
 - `GET /healthz` — liveness; reports the current listener count and whether the
   upstream is delivering bytes, without touching the origin. Example:
 
